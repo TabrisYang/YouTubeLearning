@@ -624,6 +624,42 @@ class TestPrefsFlow:
         settings_flow.handle("ug7", "取消")
 
 
+class TestKeyAdaptation:
+    """開箱即用：填哪家的 key 就自動用哪家的模型。"""
+
+    def test_google_only_switches_models_to_gemini(self, fresh_repo, monkeypatch):
+        from config import get_settings
+
+        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("GOOGLE_API_KEY", "gemini-key")
+        get_settings.cache_clear()
+        settings = fresh_repo.get_llm_settings()
+        assert settings["eval_model"].startswith("gemini")
+        assert settings["curate_model"].startswith("gemini")
+        get_settings.cache_clear()
+
+    def test_anthropic_key_keeps_claude_defaults(self, fresh_repo, monkeypatch):
+        from config import get_settings
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant")
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        get_settings.cache_clear()
+        settings = fresh_repo.get_llm_settings()
+        assert settings["eval_model"].startswith("claude")
+        get_settings.cache_clear()
+
+    def test_no_keys_leaves_settings_untouched(self, fresh_repo, monkeypatch):
+        from config import DEFAULT_LLM_SETTINGS, get_settings
+
+        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        get_settings.cache_clear()
+        assert (fresh_repo.get_llm_settings()["eval_model"]
+                == DEFAULT_LLM_SETTINGS["eval_model"])
+        get_settings.cache_clear()
+
+
 class TestSimplifiedChinese:
     def test_is_simplified_detection(self):
         s = make_candidate(video_id="s", title="一口气讲透K线技术分析，让你少走弯路", description="")

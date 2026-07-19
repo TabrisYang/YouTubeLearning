@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-from config import get_settings
+from config import get_settings, provider_of_model  # noqa: F401 — 單一實作，router 再匯出
 from pipeline.models import LLMCallRecord, UserContext
 
 from .providers.anthropic_p import AnthropicProvider
@@ -31,17 +31,6 @@ _PURPOSE_TO_SETTING = {
     "curate": "curate_model",
     "intent": "intent_model",
 }
-
-
-def provider_of_model(model: str) -> str:
-    """由模型 id 推斷廠商。"""
-    if model.startswith("claude"):
-        return "anthropic"
-    if model.startswith(("gpt", "o1", "o3", "o4", "chatgpt")):
-        return "openai"
-    if model.startswith("gemini"):
-        return "google"
-    raise ValueError(f"無法判斷模型所屬廠商: {model}")
 
 
 def _platform_key(provider: str) -> str:

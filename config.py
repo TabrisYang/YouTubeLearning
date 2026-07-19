@@ -82,3 +82,56 @@ DEFAULT_LLM_SETTINGS: dict = {
     "fixed_points_per_course": 20,
     "free_daily_quota": 1,
 }
+
+# 各廠商的對應模型（自架者只填了某一家的 key 時，自動切換過去 —— 開箱即用）
+PROVIDER_DEFAULT_MODELS: dict[str, dict] = {
+    "anthropic": {"eval_model": "claude-haiku-4-5", "curate_model": "claude-sonnet-4-6",
+                  "intent_model": "claude-haiku-4-5"},
+    "openai": {"eval_model": "gpt-4o-mini", "curate_model": "gpt-4o",
+               "intent_model": "gpt-4o-mini"},
+    "google": {"eval_model": "gemini-3-flash-preview", "curate_model": "gemini-3-flash-preview",
+               "intent_model": "gemini-3-flash-preview"},
+}
+
+_MODEL_PREFIXES = {
+    "anthropic": ("claude",),
+    "openai": ("gpt", "o1", "o3", "o4", "chatgpt"),
+    "google": ("gemini",),
+}
+
+
+def provider_of_model(model: str) -> str:
+    """由模型 id 推斷廠商。"""
+    for provider, prefixes in _MODEL_PREFIXES.items():
+        if model.startswith(prefixes):
+            return provider
+    raise ValueError(f"無法判斷模型所屬廠商: {model}")
+
+
+def available_providers() -> list[str]:
+    """平台已配置 key 的廠商（依偏好順序）。"""
+    s = get_settings()
+    keys = {"anthropic": s.anthropic_api_key, "openai": s.openai_api_key,
+            "google": s.google_api_key}
+    return [p for p in ("anthropic", "openai", "google") if keys[p]]
+
+
+def adapt_settings_to_available_keys(settings: dict) -> dict:
+    """設定的模型所屬廠商沒有平台 key → 自動換成有 key 的廠商對應模型。
+
+    讓自架者「填哪家的 key 就用哪家」，不必手動改設定檔。
+    使用者明確在後台指定過的模型不受影響（有 key 就照用）。
+    """
+    available = available_providers()
+    if not available:
+        return settings
+    adapted = dict(settings)
+    for purpose_key in ("eval_model", "curate_model", "intent_model"):
+        model = adapted.get(purpose_key, "")
+        try:
+            if provider_of_model(model) in available:
+                continue
+        except ValueError:
+            pass
+        adapted[purpose_key] = PROVIDER_DEFAULT_MODELS[available[0]][purpose_key]
+    return adapted

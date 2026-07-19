@@ -209,8 +209,10 @@ def _readiness_problems(user_id: str) -> list[str]:
                         "google": s.google_api_key}.get(provider, "")
         if not platform_key:
             problems.append(
-                "⚙️ 點數制生成目前未開放（平台金鑰未配置）。\n"
-                "請輸入「設定」→ 選 2 改用自備 API key（走你自己的額度、不扣點）。")
+                "⚙️ 尚未配置任何 LLM 金鑰。\n"
+                "・自架者：在 .env 填入 ANTHROPIC_API_KEY、OPENAI_API_KEY 或 GOOGLE_API_KEY "
+                "任一把即可（系統會自動採用該廠商的模型）\n"
+                "・一般使用者：輸入「設定」→ 選 2 自備 API key（走你自己的額度、不扣點）")
     elif mode == "byok_api_key" and not keyvault.get_api_key(user_id, "llm"):
         problems.append(
             "🔑 你的 API key 已過期（安全起見系統不儲存 key）。\n"

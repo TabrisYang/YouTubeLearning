@@ -10,7 +10,8 @@ import time
 import uuid
 from typing import Any, Optional
 
-from config import DEFAULT_LLM_SETTINGS, get_settings
+from config import (DEFAULT_LLM_SETTINGS, adapt_settings_to_available_keys,
+                    get_settings)
 
 
 class BaseRepo:
@@ -69,7 +70,7 @@ class InMemoryRepo(BaseRepo):
         self._feedback: list[dict] = []
 
     def get_llm_settings(self) -> dict:
-        return dict(self._config["llm_settings"])
+        return adapt_settings_to_available_keys(self._config["llm_settings"])
 
     def set_llm_settings(self, patch: dict) -> dict:
         with self._lock:
@@ -179,7 +180,8 @@ class FirestoreRepo(BaseRepo):
         if self._settings_cache and now - self._settings_cache[0] < self._LLM_SETTINGS_CACHE_TTL:
             return dict(self._settings_cache[1])
         doc = self._db.collection("config").document("llm_settings").get()
-        merged = {**DEFAULT_LLM_SETTINGS, **(doc.to_dict() or {})}
+        merged = adapt_settings_to_available_keys(
+            {**DEFAULT_LLM_SETTINGS, **(doc.to_dict() or {})})
         self._settings_cache = (now, merged)
         return dict(merged)
 
