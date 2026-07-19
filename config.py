@@ -89,6 +89,9 @@ PROVIDER_DEFAULT_MODELS: dict[str, dict] = {
                   "intent_model": "claude-haiku-4-5"},
     "openai": {"eval_model": "gpt-4o-mini", "curate_model": "gpt-4o",
                "intent_model": "gpt-4o-mini"},
+    # Gemini 單獨挑大樑（2-key 最小配置）：編排本該用強模型，但免費層 Pro 級無額度，
+    # 保守選 Flash 確保跑得起來 —— 想要更好的編排品質請加一把 Anthropic/OpenAI key，
+    # 或在後台把 curate_model 改成 gemini-3-pro-preview（需付費層）
     "google": {"eval_model": "gemini-3-flash-preview", "curate_model": "gemini-3-flash-preview",
                "intent_model": "gemini-3-flash-preview"},
 }

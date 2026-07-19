@@ -37,18 +37,25 @@ cp .env.example .env
 
 ### 2. 準備 API keys（全部有免費額度）
 
-| Key | 用途 | 去哪申請 | 必要性 |
+系統有三個吃 key 的環節，**建議三把（推薦配置）**：
+
+| 環節 | Key | 用途 | 去哪申請 |
 |---|---|---|---|
-| `YOUTUBE_API_KEY` | 搜尋影片（免費 10,000 units/天 ≈ 20 門課） | ① [啟用 API](https://console.cloud.google.com/apis/library/youtube.googleapis.com) → ② [建立金鑰](https://console.cloud.google.com/apis/credentials) | **必要** |
-| `GOOGLE_API_KEY` | Gemini 影片理解（免費層每天約 2 門課） | [Google AI Studio](https://aistudio.google.com/apikey) → Create API key | **必要** |
-| `ANTHROPIC_API_KEY` | 課綱編排（也可改用 OpenAI / Gemini） | [Anthropic Console](https://console.anthropic.com/settings/keys) | 三選一 |
-| `OPENAI_API_KEY` | 同上（替代方案） | [OpenAI Platform](https://platform.openai.com/api-keys) | 三選一 |
+| 🔍 **搜尋** | `YOUTUBE_API_KEY` | 找候選影片（免費 10,000 units/天 ≈ 20 門課） | ① [啟用 API](https://console.cloud.google.com/apis/library/youtube.googleapis.com) → ② [建立金鑰](https://console.cloud.google.com/apis/credentials) |
+| 🎬 **看影片** | `GOOGLE_API_KEY` | Gemini 影片理解（免費層每天約 2 門課）—— **目前唯一能合法「看完」影片的管道** | [Google AI Studio](https://aistudio.google.com/apikey) → Create API key |
+| 🧠 **編排課綱** | `ANTHROPIC_API_KEY`<br>或 `OPENAI_API_KEY` | 依知識依賴排序、寫摘要與檢核題（吃推理能力） | [Anthropic](https://console.anthropic.com/settings/keys)／[OpenAI](https://platform.openai.com/api-keys) |
 
-把 key 填進 `.env` 對應欄位即可。想改用 OpenAI/Gemini 當編排模型，改 `config.py` 的
-`DEFAULT_LLM_SETTINGS`（或部署後用 `PATCH /admin/llm-settings` 熱調）。
+**兩種配置的差別**：
 
-> 💡 只想先看看能不能跑？填 `YOUTUBE_API_KEY` + `GOOGLE_API_KEY` 兩把就能生成課程
-> （編排也可走 Gemini）。單元測試則完全不需要任何 key。
+| 配置 | Key 數 | 編排模型 | 適合 |
+|---|---|---|---|
+| 最小 | 2 把（YouTube + Gemini） | Gemini Flash 級（Gemini 一人分飾兩角） | 先確認系統能跑；免費層 Pro 級無額度，編排品質有妥協 |
+| **推薦** | **3 把**（+ Anthropic 或 OpenAI） | Claude Sonnet／GPT-4o | 正式使用；專案的課綱壓測就是這個組合 |
+
+系統會**自動偵測你填了哪些 key** 並採用對應模型，不需要手動改設定檔。
+之後想換模型：`PATCH /admin/llm-settings`（免重新部署）。
+
+> 💡 單元測試（`pytest tests/ -q`）完全不需要任何 key。
 
 ### 3. 啟動測試介面
 
