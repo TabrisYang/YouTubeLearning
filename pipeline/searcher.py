@@ -14,7 +14,7 @@ import httpx
 
 import llm
 from config import get_settings
-from pipeline.models import UserContext, VideoCandidate
+from pipeline.models import LearningContract, UserContext, VideoCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,12 @@ _EXPAND_SYSTEM = """\
 你是課程策展助手。使用者給你一個學習主題，請展開成 3-5 組 YouTube 搜尋關鍵字，
 涵蓋：中文與英文、入門與進階詞彙。只輸出 JSON 陣列，不要任何其他文字。
 範例輸入：AI工作流
-範例輸出：["AI 工作流 教學", "n8n tutorial", "AI automation workflow", "AI agent 入門", "LangChain 實戰"]"""
+範例輸出：["AI 工作流 教學", "n8n tutorial", "AI automation workflow", "AI agent 入門", "LangChain 實戰"]
+
+若輸入附有「學習契約」，關鍵字展開是它的第一道執行者：
+・每組關鍵字都必須指向「必須涵蓋」的子主題，禁止產生指向「排除」清單的關鍵字
+・語言為 zh_only 時只出中文關鍵字；zh_first 出中文為主、至多 1 組英文
+・起始難度 3 以上時偏進階實戰詞彙，1-2 時偏入門教學詞彙"""
 
 
 class QuotaExceeded(Exception):
@@ -32,10 +37,13 @@ class QuotaExceeded(Exception):
 
 
 def expand_topic(topic: str, user_ctx: UserContext, job_id: str | None = None,
-                 advanced: bool = False) -> list[str]:
+                 advanced: bool = False,
+                 contract: LearningContract | None = None) -> list[str]:
     """LLM 展開主題為 3-5 組搜尋關鍵字。advanced=True 時偏向進階/深入詞彙。"""
     content = (f"{topic}（使用者已完成入門課程，請給進階、深入、實戰導向的關鍵字）"
                if advanced else topic)
+    if contract is not None:
+        content += "\n學習契約：\n" + "\n".join(contract.summary_lines())
     text = llm.complete(
         "intent",
         [{"role": "user", "content": content}],

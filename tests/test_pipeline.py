@@ -1047,3 +1047,218 @@ class TestSettingsFlow:
         assert "訂閱制連線成功" in msgs[0]
         assert fresh_repo.get_user("u7")["oauth_model"] == "claude-opus-4-8"
         get_settings.cache_clear()
+
+
+# ---------- 學習契約與 grill 式開課訪談 ----------
+
+class TestLearningContract:
+    def test_defaults_and_summary(self):
+        from pipeline.models import LearningContract
+
+        c = LearningContract(topic="技術分析基礎")
+        assert c.start_difficulty == 1 and c.language == "zh_first"
+        text = "\n".join(c.summary_lines())
+        assert "技術分析基礎" in text and "4–45 分鐘" in text
+
+    def test_low_trust_note_in_summary(self):
+        from pipeline.models import LearningContract
+
+        c = LearningContract(topic="技術分析", low_trust_popularity=True,
+                             channel_blocklist=["帶單老師"])
+        text = "\n".join(c.summary_lines())
+        assert "流量≠品質" in text and "帶單老師" in text
+
+    def test_default_contract_maps_level(self):
+        from delivery.intake_flow import default_contract
+
+        assert default_contract("Python", "beginner").start_difficulty == 1
+        assert default_contract("Python", "some").start_difficulty == 2
+        assert default_contract("Python", "advanced").start_difficulty == 3
+        assert default_contract("Python").start_difficulty == 1
+
+
+class TestGrillIntake:
+    """grill 式開課：一次一題附建議 → 學習契約 → 確認 → 堂數 → 生成（契約入庫）。"""
+
+    def _msg(self, user_id, text):
+        from fastapi import BackgroundTasks
+
+        import main
+        from delivery import line_client
+
+        main._handle_text(user_id, "tok", text, BackgroundTasks())
+        return [m["text"] for m in line_client.drain_dev_outbox()]
+
+    def _script_llm(self, monkeypatch, responses: list[str]):
+        """把 llm.complete 換成照劇本輪流回覆。"""
+        import llm
+
+        seq = list(responses)
+        monkeypatch.setattr(llm, "complete",
+                            lambda *a, **k: seq.pop(0) if seq else "{}")
+
+    _CONTRACT_JSON = (
+        '{"type": "contract", "contract": {"topic": "K線與量價結構基礎", '
+        '"include": ["K線", "量價"], "exclude": ["選擇權"], "language": "zh_first", '
+        '"chinese_script": "no_simplified", "start_difficulty": 2, '
+        '"min_duration_min": 8, "max_duration_min": 30, "recency_months": 24, '
+        '"channel_blocklist": [], "channel_prioritize": [], '
+        '"teaching_style_pref": "實作看盤示範優先", "low_trust_popularity": true}}')
+
+    def test_grill_to_contract_to_generation(self, fresh_repo, monkeypatch):
+        from config import get_settings
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-platform")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "yt-platform")
+        get_settings.cache_clear()
+        points.topup("ug", 100)
+        self._script_llm(monkeypatch, [
+            '{"type": "ask", "question": "你想學的是哪一塊？", '
+            '"recommendation": "建議從 K 線與量價開始"}',
+            self._CONTRACT_JSON,
+        ])
+
+        self._msg("ug", "開課")
+        msgs = self._msg("ug", "技術分析")            # 第一輪 → 追問
+        assert any("❓" in m and "💡 建議" in m for m in msgs)
+        msgs = self._msg("ug", "K線和量價")            # 第二輪 → 收斂成契約
+        assert any("學習契約確認" in m and "K線與量價結構基礎" in m for m in msgs)
+        assert any("流量≠品質" in m for m in msgs)     # 財經領域降權有進契約
+
+        msgs = self._msg("ug", "確認")                # 契約 → 堂數
+        assert any("幾堂課" in m for m in msgs)
+        msgs = self._msg("ug", "5")
+        assert any("5 堂" in m for m in msgs)
+        msgs = self._msg("ug", "確認")                # 報價 → 生成
+        assert any("開始為你策展" in m for m in msgs)
+
+        cid = (fresh_repo.get_user("ug") or {})["last_course_id"]
+        course = fresh_repo.get_course(cid)
+        assert course["topic"] == "K線與量價結構基礎"   # 用收斂後的主題
+        assert course["contract"]["low_trust_popularity"] is True
+        assert course["contract"]["exclude"] == ["選擇權"]
+        get_settings.cache_clear()
+
+    def test_contract_revision(self, fresh_repo, monkeypatch):
+        """契約確認時用自然語言修改 → 重新呈現修訂版。"""
+        from config import get_settings
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-platform")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "yt-platform")
+        get_settings.cache_clear()
+        revised = self._CONTRACT_JSON.replace('"max_duration_min": 30',
+                                              '"max_duration_min": 20')
+        # revise 只輸出契約本體（不含 type 包裝）
+        import json as _json
+        revised_body = _json.dumps(_json.loads(revised)["contract"], ensure_ascii=False)
+        self._script_llm(monkeypatch, [self._CONTRACT_JSON, revised_body])
+
+        self._msg("ur", "開課")
+        msgs = self._msg("ur", "技術分析")            # 主題夠明確 → 直接出契約
+        assert any("學習契約確認" in m for m in msgs)
+        msgs = self._msg("ur", "片長上限改 20 分鐘")
+        assert any("8–20 分鐘" in m for m in msgs)
+        get_settings.cache_clear()
+
+    def test_llm_down_falls_back_to_fixed_flow(self, fresh_repo, monkeypatch):
+        """LLM 不可用（conftest 預設擋掉）→ 退回固定三題，功能不斷。"""
+        from config import get_settings
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-platform")
+        monkeypatch.setenv("YOUTUBE_API_KEY", "yt-platform")
+        get_settings.cache_clear()
+
+        self._msg("uf", "開課")
+        msgs = self._msg("uf", "技術分析")
+        assert any("程度" in m for m in msgs)          # 退回舊版程度診斷
+        get_settings.cache_clear()
+
+
+class TestContractFilters:
+    """粗篩服從契約：片長/時效/頻道黑白名單/污染領域流量降權。"""
+
+    def _contract(self, **kw):
+        from pipeline.models import LearningContract
+
+        base = dict(topic="技術分析")
+        base.update(kw)
+        return LearningContract(**base)
+
+    def test_duration_from_contract(self):
+        c8 = make_candidate(video_id="a", duration_sec=8 * 60)
+        c40 = make_candidate(video_id="b", duration_sec=40 * 60)
+        result = filters.apply([c8, c40], now=NOW,
+                               contract=self._contract(max_duration_min=30))
+        assert [c.video_id for c in result] == ["a"]
+
+    def test_channel_blocklist(self):
+        bad = make_candidate(video_id="a", channel_title="帶單老師王")
+        ok = make_candidate(video_id="b", channel_title="正經教學台")
+        result = filters.apply([bad, ok], now=NOW,
+                               contract=self._contract(channel_blocklist=["帶單"]))
+        assert [c.video_id for c in result] == ["b"]
+
+    def test_recency_hard_filter_with_relax(self):
+        old = make_candidate(video_id="old", published_at="2023-01-01T00:00:00Z")
+        new = make_candidate(video_id="new", published_at="2026-06-01T00:00:00Z")
+        # 新片不足 MIN_SHORTLIST_FOR_RECENCY → 放寬，舊片仍保留
+        result = filters.apply([old, new], now=NOW,
+                               contract=self._contract(recency_months=12))
+        assert {c.video_id for c in result} == {"old", "new"}
+        # 新片夠多 → 舊片被時效硬篩掉
+        many_new = [make_candidate(video_id=f"n{i}",
+                                   published_at="2026-06-01T00:00:00Z")
+                    for i in range(8)]
+        result = filters.apply([old] + many_new, now=NOW,
+                               contract=self._contract(recency_months=12))
+        assert "old" not in {c.video_id for c in result}
+
+    def test_low_trust_popularity_downweights_views(self):
+        """污染領域：高流量老片輸給流量普通的新片（正常權重下相反）。"""
+        viral_old = make_candidate(video_id="viral", like_count=2000, view_count=50_000,
+                                   subscriber_count=10_000,
+                                   published_at="2023-06-01T00:00:00Z")
+        modest_new = make_candidate(video_id="new", like_count=60, view_count=3_000,
+                                    subscriber_count=50_000,
+                                    published_at="2026-06-01T00:00:00Z")
+        assert filters.score(viral_old, NOW) > filters.score(modest_new, NOW)
+        assert (filters.score(modest_new, NOW, low_trust_popularity=True)
+                > filters.score(viral_old, NOW, low_trust_popularity=True))
+
+    def test_channel_prioritize_boost(self):
+        pocket = make_candidate(video_id="p", channel_title="口袋名單頻道", like_count=200)
+        other = make_candidate(video_id="o", channel_title="其他頻道", like_count=400)
+        result = filters.apply([other, pocket], target=2, now=NOW,
+                               contract=self._contract(channel_prioritize=["口袋名單"]))
+        assert result[0].video_id == "p"
+
+    def test_contract_language_overrides_prefs(self):
+        zh = make_candidate(video_id="zh")
+        en = make_candidate(video_id="en", title="Python tutorial", description="english")
+        result = filters.apply([zh, en], target=5, now=NOW,
+                               prefs={"language": "any"},
+                               contract=self._contract(language="zh_only"))
+        assert [c.video_id for c in result] == ["zh"]
+
+
+class TestContractGate:
+    """評估後守門：導流片、低吻合度、過時影片一律剔除。"""
+
+    def test_passes_contract(self):
+        import worker
+        from pipeline.models import VideoEvaluation
+
+        ok = VideoEvaluation(video_id="a", difficulty=2, quality_score=7,
+                             contract_fit=8.0)
+        promo = VideoEvaluation(video_id="b", difficulty=2, quality_score=7,
+                                contract_fit=9.0, is_promotional=True)
+        low_fit = VideoEvaluation(video_id="c", difficulty=2, quality_score=7,
+                                  contract_fit=2.0)
+        outdated = VideoEvaluation(video_id="d", difficulty=2, quality_score=7,
+                                   is_outdated=True)
+        legacy = VideoEvaluation(video_id="e", difficulty=2, quality_score=7)  # 無契約評估
+        assert worker._passes_contract(ok)
+        assert not worker._passes_contract(promo)
+        assert not worker._passes_contract(low_fit)
+        assert not worker._passes_contract(outdated)
+        assert worker._passes_contract(legacy)

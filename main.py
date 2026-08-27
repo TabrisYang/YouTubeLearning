@@ -537,7 +537,7 @@ _NLU_SYSTEM = """\
 搜集影片並編排成由淺入深的課程。請用繁體中文、150 字內、親切地回覆。
 
 系統指令（使用者必須輸入這些格式才會觸發功能）：
-・開課 → 進入逐步引導（先問主題再問堂數，最推薦新手）
+・開課 → 進入逐步引導（AI 訪談收斂「學習契約」：一次一題附建議答案，最推薦新手）
 ・開課 <主題> <堂數>（例：開課 AI工作流 5）→ 一行式，之後回「確認開課 <主題> <堂數>」
 ・今日課程 / 完成 / 答案 / 我的課程 / 我的點數
 ・課程列表 → 全部堂數一覽；「第 3 堂」可跳看任一堂
@@ -606,7 +606,12 @@ def _smart_fallback(user_id: str, text: str) -> str:
 
 def _handle_course_flow(user_id: str, reply_token: str, text: str,
                         session: dict, background: BackgroundTasks) -> None:
-    """逐步開課：問主題 → 問堂數 → 報價 → 回「確認」即開始。"""
+    """逐步開課：問主題 → grill 式訪談收斂學習契約 → 問堂數 → 報價 → 確認即開始。
+
+    grill 訪談（intake_flow）需要 LLM；不可用時退回舊版固定三題（level），功能不斷。
+    """
+    from delivery import intake_flow
+
     repo = get_repo()
     skey = f"course:{user_id}"
 
@@ -617,16 +622,58 @@ def _handle_course_flow(user_id: str, reply_token: str, text: str,
 
     step = session.get("step")
 
+    def _fallback_to_level(topic: str) -> None:
+        session.update(step="level", topic=topic)
+        keyvault.sessions.set(skey, session)
+        line_client.reply(reply_token, [
+            f"好的，主題是「{topic}」！\n"
+            "你目前對這個主題的程度是？（影響課程難度起點）\n"
+            "1. 完全新手\n2. 有一些基礎\n3. 想深入進階"])
+
     if step == "topic":
         if not text or len(text) > 30:
             line_client.reply(reply_token, ["主題請用 30 字以內描述，例如：AI工作流"])
             return
-        session.update(step="level", topic=text)
-        keyvault.sessions.set(skey, session)
-        line_client.reply(reply_token, [
-            f"好的，主題是「{text}」！\n"
-            "你目前對這個主題的程度是？（影響課程難度起點）\n"
-            "1. 完全新手\n2. 有一些基礎\n3. 想深入進階"])
+        try:
+            msgs, patch = intake_flow.start(
+                text, worker.build_user_ctx(user_id), job_id=f"intake-{user_id}")
+            session.update(topic=text, **patch)
+            keyvault.sessions.set(skey, session)
+            line_client.reply(reply_token, msgs)
+        except Exception:
+            logger.info("grill 訪談不可用，退回固定流程（user=%s）", user_id)
+            _fallback_to_level(text)
+        return
+
+    if step == "grill":
+        try:
+            msgs, patch = intake_flow.answer(
+                session, text, worker.build_user_ctx(user_id), job_id=f"intake-{user_id}")
+            session.update(**patch)
+            keyvault.sessions.set(skey, session)
+            line_client.reply(reply_token, msgs)
+        except Exception:
+            logger.info("grill 訪談中斷，退回固定流程（user=%s）", user_id)
+            _fallback_to_level(session["topic"])
+        return
+
+    if step == "contract_confirm":
+        if text in ("確認", "好", "ok", "OK", "是"):
+            session.update(step="count")
+            keyvault.sessions.set(skey, session)
+            line_client.reply(reply_token, ["想要幾堂課？回覆數字就好（建議 3～10 堂）"])
+            return
+        try:
+            contract = intake_flow.revise(
+                session["contract"], text, worker.build_user_ctx(user_id),
+                job_id=f"intake-{user_id}")
+            session.update(contract=contract.model_dump())
+            keyvault.sessions.set(skey, session)
+            line_client.reply(reply_token, [intake_flow.render_confirm(contract)])
+        except Exception:
+            line_client.reply(reply_token, [
+                "這個修改我沒改成功，請換個說法（例：片長上限改 30 分鐘），"
+                "或回「確認」用目前的契約繼續。"])
         return
 
     if step == "level":
@@ -643,7 +690,8 @@ def _handle_course_flow(user_id: str, reply_token: str, text: str,
         if not text.isdigit() or not 1 <= int(text) <= 20:
             line_client.reply(reply_token, ["請回覆 1～20 的數字，例如：5"])
             return
-        n, topic = int(text), session["topic"]
+        n = int(text)
+        topic = (session.get("contract") or {}).get("topic") or session["topic"]
         settings = repo.get_llm_settings()
         user = repo.get_user(user_id) or {}
         if user.get("billing_mode", "points") != "points":
@@ -663,8 +711,10 @@ def _handle_course_flow(user_id: str, reply_token: str, text: str,
     if step == "confirm":
         if text in ("確認", "好", "ok", "OK", "是"):
             keyvault.sessions.delete(skey)
-            _start_generation(user_id, reply_token, session["topic"], session["n"], background,
-                              level=session.get("level"))
+            contract = session.get("contract")
+            topic = (contract or {}).get("topic") or session["topic"]  # 用收斂後的主題
+            _start_generation(user_id, reply_token, topic, session["n"], background,
+                              level=session.get("level"), contract=contract)
         else:
             line_client.reply(reply_token, ["回覆「確認」開始生成，或「取消」放棄。"])
         return
@@ -674,7 +724,7 @@ def _handle_course_flow(user_id: str, reply_token: str, text: str,
 
 def _start_generation(user_id: str, reply_token: str, topic: str, n: int,
                       background: BackgroundTasks, advanced_from: str | None = None,
-                      level: str | None = None) -> None:
+                      level: str | None = None, contract: dict | None = None) -> None:
     """預檢 → 防重複 → 配額 → 扣點 → 背景生成。一行式與逐步流程共用的唯一入口。"""
     repo = get_repo()
     if problems := _readiness_problems(user_id):
@@ -717,7 +767,8 @@ def _start_generation(user_id: str, reply_token: str, topic: str, n: int,
     # 先建 course 並掛到使用者身上 → 「我的課程」與智慧客服立刻看得到生成中狀態
     course_id = repo.create_course(owner=user_id, topic=topic, lesson_count=n)
     repo.update_course(course_id, {"charged_points": charged, "stage": "排隊中",
-                                   "advanced_from": advanced_from, "level": level})
+                                   "advanced_from": advanced_from, "level": level,
+                                   "contract": contract})
     repo.upsert_user(user_id, {"last_course_id": course_id})
 
     kind = "進階課程" if advanced_from else "課程"

@@ -10,30 +10,53 @@ import json
 import logging
 
 import llm
-from pipeline.models import (CoursePlan, Lesson, QuizItem, TranscriptResult,
-                             UserContext, VideoCandidate, VideoEvaluation)
+from pipeline.models import (CoursePlan, LearningContract, Lesson, QuizItem,
+                             TranscriptResult, UserContext, VideoCandidate,
+                             VideoEvaluation)
 from pipeline.transcript import sample_for_eval
 
 logger = logging.getLogger(__name__)
 
 MAX_JSON_RETRIES = 2
 
-_EVAL_SYSTEM = """\
-你是課程策展的影片評估員。根據影片的字幕節錄（或 metadata）與統計資料，輸出評估 JSON。
-只輸出 JSON 物件，不要任何其他文字，格式：
+_EVAL_JSON_BASE = """\
 {"difficulty": 1-5 整數（1=零基礎可看, 5=需深厚先備知識）,
  "quality_score": 0-10 數字（講解清晰度、結構、資訊密度）,
  "topics_covered": ["涵蓋的子主題", ...],
  "teaching_style": "簡短描述（如：實作演示 / 概念講解 / 案例分析）",
- "is_outdated": true/false（內容是否已過時）}"""
+ "is_outdated": true/false（內容是否已過時）"""
+
+_EVAL_JSON_CONTRACT_EXTRA = """,
+ "contract_fit": 0-10 數字（影片內容與學習契約的吻合度：涵蓋「必須涵蓋」給高分、
+   觸及「排除」清單或偏離主題給低分）,
+ "is_promotional": true/false（主要目的是導流、賣課、帶單、推銷服務，而非教學；
+   財經投資領域請特別嚴格：後見之明的「神準預測」、喊單、誘導加群組都算 true）"""
+
+
+def _eval_system(contract: LearningContract | None) -> str:
+    head = "你是課程策展的影片評估員。根據影片的字幕節錄（或 metadata）與統計資料，輸出評估 JSON。\n"
+    if contract is None:
+        return (head + "只輸出 JSON 物件，不要任何其他文字，格式：\n"
+                + _EVAL_JSON_BASE + "}")
+    return (head
+            + "評估必須逐條對照這份學習契約（它是使用者確認過的選片憲法）：\n"
+            + "\n".join(contract.summary_lines()) + "\n"
+            + "只輸出 JSON 物件，不要任何其他文字，格式：\n"
+            + _EVAL_JSON_BASE + _EVAL_JSON_CONTRACT_EXTRA + "}")
+
+
+# 舊介面相容（無契約時的預設系統提示詞）
+_EVAL_SYSTEM = _eval_system(None)
 
 _CURATE_SYSTEM = """\
 你是課程總編。以下是一批已評估的 YouTube 影片，請編排成由淺入深的課程。
 規則：
-1. 依知識依賴關係排序：先修內容在前，難度遞增
-2. 同主題重複的影片只留 quality_score 最高者
+1. 依知識依賴關係排序：先修內容在前。難度從起始難度開始整體遞增，
+   相鄰兩堂可持平、禁止下降；不可為了湊堂數打亂先修鏈
+2. 同主題重複的影片只留 quality_score 最高者（有 contract_fit 時以它為優先依據）
 3. 每堂課輸出：AI 重新撰寫的摘要（繁體中文，120 字內，不可抄字幕）、
-   2-3 條學習目標、3 題檢核題（附答案）、與上一堂的銜接說明（第一堂免）
+   2-3 條學習目標、3 題檢核題（附答案）、與上一堂的銜接說明（第一堂免）——
+   銜接說明必須講清楚「這堂用到上一堂的什麼知識」，不是排在這裡的空話
 4. 湊不滿要求堂數時誠實回報，在 honest_note 說明建議堂數，禁止灌水湊數
 只輸出 JSON 物件，不要任何其他文字，格式：
 {"lessons": [{"video_id": "...", "summary": "...", "learning_goals": ["..."],
@@ -70,7 +93,8 @@ def _complete_json(purpose: str, user_prompt: str, user_ctx: UserContext,
 # ---------- 第一段：評估 ----------
 
 def evaluate(candidate: VideoCandidate, transcript: TranscriptResult,
-             user_ctx: UserContext, job_id: str | None = None) -> VideoEvaluation | None:
+             user_ctx: UserContext, job_id: str | None = None,
+             contract: LearningContract | None = None) -> VideoEvaluation | None:
     """單支影片評估。JSON 失敗 retry 後仍失敗 → 回 None（剔除該影片）。"""
     prompt = (
         f"影片標題: {candidate.title}\n"
@@ -81,7 +105,8 @@ def evaluate(candidate: VideoCandidate, transcript: TranscriptResult,
         f"---\n{sample_for_eval(transcript.text)}"
     )
     try:
-        data = _complete_json("eval", prompt, user_ctx, _EVAL_SYSTEM, job_id, max_tokens=800)
+        data = _complete_json("eval", prompt, user_ctx, _eval_system(contract),
+                              job_id, max_tokens=800)
         return VideoEvaluation(video_id=candidate.video_id,
                                analysis_basis=transcript.analysis_basis, **data)
     except Exception as e:
@@ -89,27 +114,32 @@ def evaluate(candidate: VideoCandidate, transcript: TranscriptResult,
         return None
 
 
-_VIDEO_EVAL_PROMPT = """\
+_VIDEO_EVAL_HEAD = """\
 請看完這支影片後進行課程策展評估。影片基本資料：
 標題: {title}
 頻道: {channel}｜時長: {minutes} 分鐘｜觀看: {views}｜發布: {published}
-
-只輸出 JSON 物件，不要任何其他文字，格式：
-{{"difficulty": 1-5 整數（1=零基礎可看, 5=需深厚先備知識）,
- "quality_score": 0-10 數字（講解清晰度、結構、資訊密度）,
- "topics_covered": ["涵蓋的子主題", ...],
- "teaching_style": "簡短描述（如：實作演示 / 概念講解 / 案例分析）",
- "is_outdated": true/false（內容是否已過時）}}"""
+"""
 
 
-def evaluate_by_video(candidate: VideoCandidate, user_ctx: UserContext,
-                      job_id: str | None = None) -> VideoEvaluation | None:
-    """Gemini 直接看影片評估（取代已被封鎖的字幕路線）。失敗回 None，由呼叫端降級。"""
-    prompt = _VIDEO_EVAL_PROMPT.format(
+def _video_eval_prompt(candidate: VideoCandidate,
+                       contract: LearningContract | None) -> str:
+    head = _VIDEO_EVAL_HEAD.format(
         title=candidate.title, channel=candidate.channel_title,
         minutes=candidate.duration_sec // 60, views=candidate.view_count,
         published=candidate.published_at,
     )
+    if contract is not None:
+        head += ("\n評估必須逐條對照這份學習契約（使用者確認過的選片憲法）：\n"
+                 + "\n".join(contract.summary_lines()) + "\n")
+    schema = _EVAL_JSON_BASE + (_EVAL_JSON_CONTRACT_EXTRA if contract else "") + "}"
+    return head + "\n只輸出 JSON 物件，不要任何其他文字，格式：\n" + schema
+
+
+def evaluate_by_video(candidate: VideoCandidate, user_ctx: UserContext,
+                      job_id: str | None = None,
+                      contract: LearningContract | None = None) -> VideoEvaluation | None:
+    """Gemini 直接看影片評估（取代已被封鎖的字幕路線）。失敗回 None，由呼叫端降級。"""
+    prompt = _video_eval_prompt(candidate, contract)
     last_err: Exception | None = None
     for attempt in range(1 + MAX_JSON_RETRIES):
         try:
@@ -131,21 +161,29 @@ def evaluate_by_video(candidate: VideoCandidate, user_ctx: UserContext,
 def curate(topic: str, lesson_count: int,
            candidates: list[VideoCandidate], evaluations: list[VideoEvaluation],
            user_ctx: UserContext, job_id: str | None = None,
-           extra_note: str = "") -> CoursePlan:
+           extra_note: str = "", contract: LearningContract | None = None) -> CoursePlan:
     by_id = {c.video_id: c for c in candidates}
     lines = []
     for ev in evaluations:
         c = by_id[ev.video_id]
-        lines.append(json.dumps({
+        row = {
             "video_id": ev.video_id, "title": c.title, "channel": c.channel_title,
             "duration_min": c.duration_sec // 60, "difficulty": ev.difficulty,
             "quality_score": ev.quality_score, "topics_covered": ev.topics_covered,
             "teaching_style": ev.teaching_style, "is_outdated": ev.is_outdated,
             "analysis_basis": ev.analysis_basis,
-        }, ensure_ascii=False))
+        }
+        if ev.contract_fit is not None:
+            row["contract_fit"] = ev.contract_fit
+        lines.append(json.dumps(row, ensure_ascii=False))
 
+    contract_block = ""
+    if contract is not None:
+        contract_block = ("學習契約（編排必須服從；起始難度即第一堂的難度基準）:\n"
+                          + "\n".join(contract.summary_lines()) + "\n")
     prompt = (
         f"學習主題: {topic}\n要求堂數: {lesson_count}\n"
+        + contract_block
         + (f"特別要求: {extra_note}\n" if extra_note else "")
         + "已評估影片（每行一支）:\n" + "\n".join(lines)
     )

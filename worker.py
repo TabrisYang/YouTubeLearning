@@ -10,7 +10,7 @@ import logging
 from billing import meter, points
 from delivery import formatter, line_client
 from pipeline import curator, filters, searcher, transcript
-from pipeline.models import UserContext
+from pipeline.models import LearningContract, UserContext, VideoEvaluation
 from storage.firestore_repo import get_repo
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,18 @@ def build_user_ctx(user_id: str) -> UserContext:
 # 單次課程生成的 YouTube quota 預估（5 組關鍵字 × search 100 units + metadata 補查）
 _QUOTA_PER_COURSE = 600
 
+# 契約吻合度低於此值 → 剔除（評估時有給 contract_fit 才適用）
+_MIN_CONTRACT_FIT = 4.0
+
+
+def _passes_contract(ev: VideoEvaluation) -> bool:
+    """評估後的守門：過時、導流/賣課、與學習契約吻合度過低的影片一律剔除。"""
+    if ev.is_outdated or ev.is_promotional:
+        return False
+    if ev.contract_fit is not None and ev.contract_fit < _MIN_CONTRACT_FIT:
+        return False
+    return True
+
 
 def _today() -> str:
     from datetime import date
@@ -78,13 +90,27 @@ def generate_course(user_id: str, topic: str, lesson_count: int,
         repo.update_course(course_id, {"advanced_from": advanced_from})
     job_id = course_id  # usage_logs 以 course_id 為 job 單位
 
+    # 學習契約（grill 式開課對話的產出）：搜尋/粗篩/評估/編排共同服從的規格。
+    # 無契約（一行式開課、LLM 退路流程）時依 level 建預設契約。
+    course_doc = repo.get_course(course_id) or {}
+    contract: LearningContract | None = None
+    if course_doc.get("contract"):
+        try:
+            contract = LearningContract(**course_doc["contract"])
+        except Exception:
+            logger.warning("[%s] 課程契約資料非法，改用預設", course_id)
+    if contract is None:
+        from delivery.intake_flow import default_contract
+
+        contract = default_contract(topic, course_doc.get("level"))
+
     # 程度診斷（逐步開課時使用者自報）→ 編排的難度起點
     level_notes = {
         "beginner": "使用者是零基礎新手：從難度 1-2 起步，第一堂必須完全不需先備知識",
         "some": "使用者有一些基礎：跳過純入門內容，從難度 2-3 起步",
         "advanced": "使用者已有相當基礎：以難度 3 以上為主，聚焦深入與實戰",
     }
-    extra_note = level_notes.get((repo.get_course(course_id) or {}).get("level", ""), "")
+    extra_note = level_notes.get(course_doc.get("level", ""), "")
 
     # 進階模式：載入基礎課程的影片（排除）與涵蓋內容（給編排參考）
     exclude_ids: set[str] = set()
@@ -115,7 +141,8 @@ def generate_course(user_id: str, topic: str, lesson_count: int,
         # 1. 主題展開 + 搜尋（使用者有自備 YouTube key 就用他的額度）
         repo.update_course(course_id, {"stage": "搜尋影片中", "progress_pct": 5})
         keywords = searcher.expand_topic(topic, user_ctx, job_id=job_id,
-                                         advanced=bool(advanced_from))
+                                         advanced=bool(advanced_from),
+                                         contract=contract)
         candidates, quota_used = searcher.search_videos(keywords, api_key=user_ctx.youtube_api_key)
         if not user_ctx.youtube_api_key:
             repo.incr_daily_counter(f"yt_quota_{_today()}", quota_used)
@@ -123,7 +150,8 @@ def generate_course(user_id: str, topic: str, lesson_count: int,
 
         # 2. 規則粗篩（套用使用者偏好：同頻道上限、語言）
         user_prefs = (repo.get_user(user_id) or {}).get("prefs", {})
-        shortlist = filters.apply(candidates, exclude_ids=exclude_ids, prefs=user_prefs)
+        shortlist = filters.apply(candidates, exclude_ids=exclude_ids, prefs=user_prefs,
+                                  contract=contract)
         logger.info("[%s] 粗篩後 %d 支", course_id, len(shortlist))
         if not shortlist:
             raise RuntimeError("粗篩後沒有任何合格影片")
@@ -144,18 +172,19 @@ def generate_course(user_id: str, topic: str, lesson_count: int,
             ev = None
             tr = transcript.fetch(c)
             if tr.analysis_basis == "transcript":
-                ev = curator.evaluate(c, tr, user_ctx, job_id=job_id)
+                ev = curator.evaluate(c, tr, user_ctx, job_id=job_id, contract=contract)
             elif i <= video_limit:
-                ev = curator.evaluate_by_video(c, user_ctx, job_id=job_id)
+                ev = curator.evaluate_by_video(c, user_ctx, job_id=job_id,
+                                               contract=contract)
             if ev is None:
                 comments = searcher.fetch_top_comments(
                     c.video_id, api_key=user_ctx.youtube_api_key)
                 if comments:
                     tr.text += "\n熱門留言:\n" + "\n".join(f"- {cm}" for cm in comments)
-                ev = curator.evaluate(c, tr, user_ctx, job_id=job_id)
+                ev = curator.evaluate(c, tr, user_ctx, job_id=job_id, contract=contract)
             if ev:
                 basis_stats[ev.analysis_basis] += 1
-                if not ev.is_outdated:
+                if _passes_contract(ev):
                     evaluations.append(ev)
         repo.update_course(course_id, {
             "basis_stats": basis_stats,
@@ -171,7 +200,8 @@ def generate_course(user_id: str, topic: str, lesson_count: int,
         # 5. 編排
         repo.update_course(course_id, {"stage": "編排課綱中", "progress_pct": 88})
         plan = curator.curate(topic, lesson_count, shortlist, evaluations,
-                              user_ctx, job_id=job_id, extra_note=extra_note)
+                              user_ctx, job_id=job_id, extra_note=extra_note,
+                              contract=contract)
         if not plan.lessons:
             raise RuntimeError("編排結果沒有任何課程")
 
