@@ -146,6 +146,40 @@ def dev_outbox():
     return {"messages": line_client.drain_dev_outbox()}
 
 
+@app.get("/dev/export")
+def dev_export():
+    """把最近一門已完成課程匯出成 Markdown 下載（D4 驗收；本機記憶體模式防資料消失）。
+
+    直接讀資料庫組 course_markdown（含影片連結、摘要、學習目標、檢核題與答案），
+    不動學習進度 —— 與 export_course.py 的訊息爬取版不同，不會把課程標記完成。
+    """
+    from urllib.parse import quote
+
+    from fastapi.responses import Response
+
+    from pipeline.models import CoursePlan
+
+    _require_dev()
+    repo = get_repo()
+    user = repo.get_user(DEV_USER) or {}
+    course = None
+    for cid in (user.get("active_course_id"), user.get("last_course_id")):
+        if cid and (c := repo.get_course(cid)) and c.get("status") == "ready":
+            course = c
+            break
+    if course is None:
+        raise HTTPException(404, "沒有已完成的課程可匯出（先開課並等生成完成）")
+
+    lessons = [Lesson(**l) for l in repo.get_lessons(course["course_id"])]
+    plan = CoursePlan(topic=course["topic"], requested_lessons=course["lesson_count"],
+                      lessons=lessons, honest_note=course.get("honest_note", ""))
+    md = formatter.course_markdown(plan)
+    fname = quote(f"課綱_{course['topic'][:30]}.md")
+    return Response(content=md, media_type="text/markdown; charset=utf-8",
+                    headers={"Content-Disposition":
+                             f"attachment; filename=\"course.md\"; filename*=UTF-8''{fname}"})
+
+
 # ---------- LINE webhook ----------
 
 def _verify_signature(body: bytes, signature: str) -> bool:

@@ -1262,3 +1262,42 @@ class TestContractGate:
         assert not worker._passes_contract(low_fit)
         assert not worker._passes_contract(outdated)
         assert worker._passes_contract(legacy)
+
+
+class TestDevExport:
+    """/dev/export：從資料庫組完整課綱 Markdown 下載，不動學習進度。"""
+
+    def test_export_ready_course(self, fresh_repo):
+        from fastapi.testclient import TestClient
+
+        import main
+
+        cid = fresh_repo.create_course(main.DEV_USER, "技術分析基礎", 2)
+        fresh_repo.update_course(cid, {"status": "ready", "honest_note": ""})
+        fresh_repo.save_lessons(cid, [
+            {"order": i, "video_id": f"v{i}", "video_url": f"https://youtu.be/v{i}",
+             "title": f"第{i}課", "channel": "ch", "duration_sec": 600,
+             "difficulty": 2, "summary": f"摘要{i}", "learning_goals": [f"目標{i}"],
+             "quiz": [{"q": f"問題{i}", "a": f"答案{i}"}], "bridge_note": ""}
+            for i in (1, 2)])
+        fresh_repo.upsert_user(main.DEV_USER, {"active_course_id": cid})
+        fresh_repo.set_progress(main.DEV_USER, cid,
+                                {"current_lesson": 1, "completed": [], "active": True})
+
+        r = TestClient(main.app).get("/dev/export")
+        assert r.status_code == 200
+        body = r.text
+        assert "技術分析基礎" in body and "https://youtu.be/v2" in body
+        assert "摘要1" in body and "目標2" in body
+        assert "問題1" in body and "答案2" in body        # 檢核題含答案
+        # 匯出不影響進度
+        progress = fresh_repo.get_progress(main.DEV_USER, cid)
+        assert progress["completed"] == []
+
+    def test_export_without_course_404(self, fresh_repo):
+        from fastapi.testclient import TestClient
+
+        import main
+
+        r = TestClient(main.app).get("/dev/export")
+        assert r.status_code == 404
