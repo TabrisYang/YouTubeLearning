@@ -1301,3 +1301,67 @@ class TestDevExport:
 
         r = TestClient(main.app).get("/dev/export")
         assert r.status_code == 404
+
+
+class TestSimplifiedLeakRegression:
+    """D4 實測抓到的洩漏：契約排除簡體，簡體影片仍進課綱。三層防禦的回歸測試。"""
+
+    LESSON2_TITLE = "趋势线画对了，进场出场都清楚了——有效突破的3个判断原则"
+
+    def test_filter_drops_real_simplified_title(self):
+        """防線一（既有）：粗篩層對真實案例的簡體判定與排除。"""
+        from pipeline.models import LearningContract
+
+        simp = make_candidate(video_id="s", title=self.LESSON2_TITLE,
+                              description="趋势是你的朋友。但多数人画错了趋势线")
+        trad = make_candidate(video_id="t")
+        contract = LearningContract(topic="技術分析", chinese_script="no_simplified")
+        result = filters.apply([simp, trad], now=NOW, contract=contract)
+        assert [c.video_id for c in result] == ["t"]
+
+    def test_revise_keeps_fields_model_omitted(self, monkeypatch):
+        """防線二（本次修正）：修約時模型漏掉的欄位保留原值，不退回預設。"""
+        import llm
+        from delivery.intake_flow import revise
+        from pipeline.models import LearningContract, UserContext
+
+        original = LearningContract(topic="技術分析", chinese_script="no_simplified",
+                                    low_trust_popularity=True,
+                                    max_duration_min=45).model_dump()
+        # 模型只回被要求改的欄位，漏掉其他所有欄位
+        monkeypatch.setattr(llm, "complete", lambda *a, **k:
+                            '{"topic": "技術分析", "max_duration_min": 30}')
+        revised = revise(original, "片長上限改 30 分鐘",
+                         UserContext(user_id="u", billing_mode="points"))
+        assert revised.max_duration_min == 30                 # 要求的修改生效
+        assert revised.chinese_script == "no_simplified"      # 沒提到的不退回預設
+        assert revised.low_trust_popularity is True
+
+    def test_eval_prompt_enforces_language(self):
+        """防線三（本次修正）：評估提示詞明令「違反語言要求 → contract_fit 最高 2」，
+        抓「標題繁體、內容簡體」這種文字偵測抓不到的案例。"""
+        from pipeline.curator import _eval_system
+        from pipeline.models import LearningContract
+
+        system = _eval_system(LearningContract(topic="技術分析",
+                                               chinese_script="no_simplified"))
+        assert "排除簡體" in system and "最高只能給 2" in system
+
+    def test_export_shows_effective_contract(self, fresh_repo):
+        """診斷：匯出檔附上實際生效的契約，驗收時可對照。"""
+        from fastapi.testclient import TestClient
+
+        import main
+
+        cid = fresh_repo.create_course(main.DEV_USER, "技術分析", 1)
+        fresh_repo.update_course(cid, {
+            "status": "ready",
+            "contract": {"topic": "技術分析", "chinese_script": "no_simplified"}})
+        fresh_repo.save_lessons(cid, [
+            {"order": 1, "video_id": "v1", "video_url": "https://youtu.be/v1",
+             "title": "第1課", "channel": "ch", "duration_sec": 600, "difficulty": 2,
+             "summary": "s", "learning_goals": [], "quiz": [], "bridge_note": ""}])
+        fresh_repo.upsert_user(main.DEV_USER, {"active_course_id": cid})
+
+        body = TestClient(main.app).get("/dev/export").text
+        assert "本課程的學習契約" in body and "排除簡體" in body

@@ -174,6 +174,14 @@ def dev_export():
     plan = CoursePlan(topic=course["topic"], requested_lessons=course["lesson_count"],
                       lessons=lessons, honest_note=course.get("honest_note", ""))
     md = formatter.course_markdown(plan)
+    if course.get("contract"):   # 附上實際生效的學習契約（驗收時對照用）
+        from pipeline.models import LearningContract
+
+        try:
+            summary = LearningContract(**course["contract"]).summary_lines()
+            md += "\n\n---\n\n## 本課程的學習契約\n" + "\n".join(f"- {s}" for s in summary)
+        except Exception:
+            pass
     fname = quote(f"課綱_{course['topic'][:30]}.md")
     return Response(content=md, media_type="text/markdown; charset=utf-8",
                     headers={"Content-Disposition":

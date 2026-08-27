@@ -141,7 +141,12 @@ def answer(session: dict, text: str, user_ctx: UserContext, job_id: str | None =
 
 def revise(contract_data: dict, instruction: str, user_ctx: UserContext,
            job_id: str | None = None) -> LearningContract:
-    """依使用者的自然語言指示修訂契約。失敗時 raise，由呼叫端請使用者換個說法。"""
+    """依使用者的自然語言指示修訂契約。失敗時 raise，由呼叫端請使用者換個說法。
+
+    確定性合併：模型輸出裡「沒提到」的欄位一律保留原值 ——
+    防模型漏欄位讓設定默默退回預設（D4 實測抓到的洩漏：修片長時
+    chinese_script 被漏掉，「排除簡體」變回「不限」而使用者不易察覺）。
+    """
     prompt = ("目前的學習契約：\n" + json.dumps(contract_data, ensure_ascii=False)
               + f"\n\n使用者的修改要求：{instruction}")
     last_err: Exception | None = None
@@ -149,7 +154,8 @@ def revise(contract_data: dict, instruction: str, user_ctx: UserContext,
         text = llm.complete("intent", [{"role": "user", "content": prompt}], user_ctx,
                             system=_REVISE_SYSTEM, max_tokens=1500, job_id=job_id)
         try:
-            return LearningContract(**json.loads(_extract_json(text)))
+            patch = json.loads(_extract_json(text))
+            return LearningContract(**{**contract_data, **patch})
         except Exception as e:
             last_err = e
     raise ValueError(f"契約修訂失敗: {last_err}")

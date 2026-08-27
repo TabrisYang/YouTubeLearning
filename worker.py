@@ -103,6 +103,9 @@ def generate_course(user_id: str, topic: str, lesson_count: int,
         from delivery.intake_flow import default_contract
 
         contract = default_contract(topic, course_doc.get("level"))
+        repo.update_course(course_id, {"contract": contract.model_dump()})
+    # 診斷：實際生效的契約進 log（D4 追查「契約有沒有傳到管線」用）
+    logger.info("[%s] 學習契約：%s", course_id, "｜".join(contract.summary_lines()))
 
     # 程度診斷（逐步開課時使用者自報）→ 編排的難度起點
     level_notes = {

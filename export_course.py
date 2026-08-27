@@ -42,6 +42,8 @@ def texts_of(messages: list[dict]) -> list[str]:
                 if isinstance(node, dict):
                     if node.get("type") == "text" and node.get("text"):
                         chunks.append(str(node["text"]))
+                    if node.get("type") == "uri" and node.get("uri"):   # 觀看影片按鈕的連結
+                        chunks.append(f"📺 {node['uri']}")
                     for v in node.values():
                         walk(v)
                 elif isinstance(node, list):
