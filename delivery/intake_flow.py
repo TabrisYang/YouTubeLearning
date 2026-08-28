@@ -28,7 +28,8 @@ _CONTRACT_SCHEMA = """\
  "start_difficulty": 1-5 整數（1=零基礎～5=進階）,
  "min_duration_min": 影片最短分鐘數（預設 4）,
  "max_duration_min": 影片最長分鐘數（預設 45）,
- "recency_months": 影片須在 N 個月內（工具/軟體類 12-24；理論通識類 null）,
+ "recency_months": 影片須在 N 個月內，數字、可用小數表達天級（3 天 ≈ 0.1、一週 ≈ 0.25；
+   新聞時事類 0.1-1；工具/軟體類 12-24；理論通識類 null）,
  "channel_blocklist": ["使用者點名排除的頻道", ...],
  "channel_prioritize": ["使用者點名的口袋頻道", ...],
  "teaching_style_pref": "教學形式偏好，例：實作跟打型優先；沒特別偏好給空字串",
@@ -83,10 +84,14 @@ def _grill_turn(topic: str, qa: list[dict], user_ctx: UserContext,
         lines.append("（訪談剛開始，還沒問過任何問題）")
     if force_contract:
         lines.append("題數已達上限，禁止再問，必須依現有資訊輸出 contract。")
-    prompt = "\n".join(lines)
+    base_prompt = "\n".join(lines)
 
     last_err: Exception | None = None
     for _ in range(1 + _JSON_RETRIES):
+        # 重試時把上次的錯誤餵回去，讓模型修正（而不是瞎重試撞一樣的牆）
+        prompt = base_prompt if last_err is None else (
+            base_prompt + f"\n\n（你上一次的輸出無法使用：{str(last_err)[:300]}。"
+                          "請修正後重新輸出符合格式與欄位型別的 JSON。）")
         text = llm.complete("intent", [{"role": "user", "content": prompt}], user_ctx,
                             system=_GRILL_SYSTEM, max_tokens=1500, job_id=job_id)
         try:
@@ -147,10 +152,13 @@ def revise(contract_data: dict, instruction: str, user_ctx: UserContext,
     防模型漏欄位讓設定默默退回預設（D4 實測抓到的洩漏：修片長時
     chinese_script 被漏掉，「排除簡體」變回「不限」而使用者不易察覺）。
     """
-    prompt = ("目前的學習契約：\n" + json.dumps(contract_data, ensure_ascii=False)
-              + f"\n\n使用者的修改要求：{instruction}")
+    base_prompt = ("目前的學習契約：\n" + json.dumps(contract_data, ensure_ascii=False)
+                   + f"\n\n使用者的修改要求：{instruction}")
     last_err: Exception | None = None
     for _ in range(1 + _JSON_RETRIES):
+        prompt = base_prompt if last_err is None else (
+            base_prompt + f"\n\n（你上一次的輸出無法使用：{str(last_err)[:300]}。"
+                          "請修正後重新輸出符合格式與欄位型別的 JSON。）")
         text = llm.complete("intent", [{"role": "user", "content": prompt}], user_ctx,
                             system=_REVISE_SYSTEM, max_tokens=1500, job_id=job_id)
         try:

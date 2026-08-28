@@ -22,13 +22,21 @@ class LearningContract(BaseModel):
     start_difficulty: int = Field(default=1, ge=1, le=5)
     min_duration_min: int = Field(default=4, ge=1)
     max_duration_min: int = Field(default=45, ge=1)
-    recency_months: Optional[int] = None        # 影片須在 N 個月內（工具類主題防過時）
+    # 影片須在 N 個月內；可用小數表達天級時效（3 天 ≈ 0.1，新聞時事類用得到）
+    recency_months: Optional[float] = Field(default=None, ge=0)
     channel_blocklist: list[str] = []           # 頻道名稱包含即排除
     channel_prioritize: list[str] = []          # 優先頻道（口袋名單）
     teaching_style_pref: str = ""               # 例：實作跟打型 > 投影片講解型
     # 財經/健康/加密貨幣等「高流量≠高品質」的污染領域：流量訊號降權，
     # 改以 AI 實看影片的教學誠意判斷為主導
     low_trust_popularity: bool = False
+
+    def _recency_label(self) -> str:
+        if not self.recency_months:
+            return "不限（以新為佳）"
+        if self.recency_months < 1:                       # 天級時效（新聞時事類）
+            return f"約 {max(1, round(self.recency_months * 30.44))} 天內"
+        return f"{self.recency_months:g} 個月內"
 
     def summary_lines(self) -> list[str]:
         """給確認訊息與 LLM 提示詞共用的人話版契約。"""
@@ -42,7 +50,7 @@ class LearningContract(BaseModel):
             f"語言：{lang}",
             f"起始難度：{self.start_difficulty}（1=零基礎～5=進階）",
             f"影片長度：{self.min_duration_min}–{self.max_duration_min} 分鐘",
-            f"發布時間：{f'{self.recency_months} 個月內' if self.recency_months else '不限（以新為佳）'}",
+            f"發布時間：{self._recency_label()}",
         ]
         if self.channel_blocklist:
             lines.append(f"排除頻道：{'、'.join(self.channel_blocklist)}")

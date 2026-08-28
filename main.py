@@ -627,20 +627,33 @@ def _build_user_state(user_id: str) -> str:
 
 
 def _smart_fallback(user_id: str, text: str) -> str:
+    """LLM 智慧客服。帶短期對話記憶（近幾輪閒聊，記憶體 15 分鐘）——
+    只記走到這裡的一般對話；指令與設定流程在上游就被攔截，API key 不會進記憶。"""
     import llm
     import worker as _worker
 
+    chat_key = f"chat:{user_id}"
+    history: list[dict] = keyvault.sessions.get(chat_key) or []
+    context = ""
+    if history:
+        context = "\n\n最近的對話（延續語境用）：\n" + "\n".join(
+            f"{'使用者' if h['role'] == 'user' else '你'}：{h['text']}" for h in history)
     try:
         user_ctx = _worker.build_user_ctx(user_id)
         answer = llm.complete(
             "intent",
             [{"role": "user", "content": text}],
             user_ctx,
-            system=_NLU_SYSTEM + "\n\n使用者目前狀態：\n" + _build_user_state(user_id),
-            max_tokens=300,
+            system=_NLU_SYSTEM + "\n\n使用者目前狀態：\n" + _build_user_state(user_id) + context,
+            max_tokens=500,
             job_id=f"nlu-{user_id}",
         )
-        return answer.strip() or _STATIC_MENU
+        answer = answer.strip() or _STATIC_MENU
+        keyvault.sessions.set(chat_key, (history + [
+            {"role": "user", "text": text[:200]},
+            {"role": "assistant", "text": answer[:200]},
+        ])[-8:])
+        return answer
     except Exception:
         logger.info("NLU 不可用，退回靜態選單（user=%s）", user_id)
         return _STATIC_MENU
@@ -714,8 +727,9 @@ def _handle_course_flow(user_id: str, reply_token: str, text: str,
             line_client.reply(reply_token, [intake_flow.render_confirm(contract)])
         except Exception:
             line_client.reply(reply_token, [
-                "這個修改我沒改成功，請換個說法（例：片長上限改 30 分鐘），"
-                "或回「確認」用目前的契約繼續。"])
+                "這個修改我沒改成功 🙏 請再說一次或換個說法\n"
+                "（例：發布時間改 3 天內、片長上限改 30 分鐘、加排除某頻道、"
+                "難度起點改 2），或回「確認」用目前的契約繼續。"])
         return
 
     if step == "level":

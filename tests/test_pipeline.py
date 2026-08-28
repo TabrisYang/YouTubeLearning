@@ -1365,3 +1365,58 @@ class TestSimplifiedLeakRegression:
 
         body = TestClient(main.app).get("/dev/export").text
         assert "本課程的學習契約" in body and "排除簡體" in body
+
+
+class TestRecencyDaysAndRetryFeedback:
+    """實測回報的修約失敗：時效只吃整數月（3 天內改不動）+ 瞎重試不帶錯誤。"""
+
+    def test_contract_accepts_fractional_months(self):
+        from pipeline.models import LearningContract
+
+        c = LearningContract(topic="AI 產業新聞", recency_months=0.1)   # ≈ 3 天
+        assert "約 3 天內" in "\n".join(c.summary_lines())
+        c2 = LearningContract(topic="n8n", recency_months=12)
+        assert "12 個月內" in "\n".join(c2.summary_lines())
+
+    def test_filters_respect_fractional_recency(self):
+        from pipeline.models import LearningContract
+
+        fresh = [make_candidate(video_id=f"f{i}", published_at="2026-07-16T00:00:00Z")
+                 for i in range(8)]                                    # 1 天前
+        old = make_candidate(video_id="old", published_at="2026-06-01T00:00:00Z")
+        contract = LearningContract(topic="AI 新聞", recency_months=0.1)
+        result = filters.apply(fresh + [old], now=NOW, contract=contract)
+        assert "old" not in {c.video_id for c in result}
+        assert len(result) == 8
+
+    def test_revise_retry_feeds_error_back(self, monkeypatch):
+        """第一次輸出非法 → 第二次提示詞必須帶上錯誤說明，且修約成功。"""
+        import llm
+        from delivery.intake_flow import revise
+        from pipeline.models import UserContext
+
+        prompts = []
+
+        def fake(purpose, messages, ctx, **kw):
+            prompts.append(messages[0]["content"])
+            if len(prompts) == 1:
+                return '{"recency_months": "三天"}'      # 非法：字串不是數字
+            return '{"recency_months": 0.1}'
+        monkeypatch.setattr(llm, "complete", fake)
+
+        revised = revise({"topic": "AI 新聞", "recency_months": 3}, "發布時間改三天內",
+                         UserContext(user_id="u", billing_mode="points"))
+        assert revised.recency_months == 0.1
+        assert "上一次的輸出無法使用" in prompts[1]      # 錯誤有餵回去
+
+    def test_smart_fallback_remembers_recent_chat(self, fresh_repo, monkeypatch):
+        import llm
+        import main
+
+        systems = []
+        monkeypatch.setattr(llm, "complete",
+                            lambda purpose, msgs, ctx, system="", **kw:
+                            (systems.append(system), "好的，收到！")[1])
+        main._smart_fallback("uc", "我比較喜歡實戰型的教學影片")
+        main._smart_fallback("uc", "照我剛剛說的偏好")
+        assert "實戰型的教學影片" in systems[1]          # 第二輪帶著第一輪的語境
