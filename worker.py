@@ -151,13 +151,27 @@ def generate_course(user_id: str, topic: str, lesson_count: int,
             repo.incr_daily_counter(f"yt_quota_{_today()}", quota_used)
         logger.info("[%s] 搜尋 %d 支（quota %d）", course_id, len(candidates), quota_used)
 
-        # 2. 規則粗篩（套用使用者偏好：同頻道上限、語言）
+        # 2. 規則粗篩（套用使用者偏好：同頻道上限、語言）。
+        #    候選不足時走放寬階梯：先放觀看門檻 → 再放時效 → 最後語言英文補位
+        #    （排除簡體與排除頻道永不放寬），並誠實告知放寬了什麼。
         user_prefs = (repo.get_user(user_id) or {}).get("prefs", {})
-        shortlist = filters.apply(candidates, exclude_ids=exclude_ids, prefs=user_prefs,
-                                  contract=contract)
-        logger.info("[%s] 粗篩後 %d 支", course_id, len(shortlist))
+        min_needed = max(8, lesson_count + 2)
+        relax_used = 0
+        shortlist: list = []
+        for relax in range(4):
+            shortlist = filters.apply(candidates, exclude_ids=exclude_ids,
+                                      prefs=user_prefs, contract=contract, relax=relax)
+            relax_used = relax
+            if len(shortlist) >= min_needed:
+                break
+        relaxed_note = filters.RELAX_NOTES.get(relax_used, "")
+        logger.info("[%s] 粗篩後 %d 支（放寬階梯 %d）", course_id, len(shortlist), relax_used)
+        repo.update_course(course_id, {"funnel": {
+            "searched": len(candidates), "shortlist": len(shortlist),
+            "relax_level": relax_used}})
         if not shortlist:
-            raise RuntimeError("粗篩後沒有任何合格影片")
+            raise RuntimeError(
+                f"搜尋 {len(candidates)} 支 → 粗篩後 0 支合格（已嘗試放寬門檻）")
 
         # 3+4. 評估（逐支；失敗剔除）— 三層策略：
         #   字幕可用 → 文字評估（已被 YouTube 大面積封鎖，可遇不可求）
@@ -193,12 +207,16 @@ def generate_course(user_id: str, topic: str, lesson_count: int,
             "basis_stats": basis_stats,
             "transcript_rate": round(basis_stats["transcript"] / len(shortlist), 2),
             "video_rate": round(basis_stats["video"] / len(shortlist), 2),
+            "funnel": {"searched": len(candidates), "shortlist": len(shortlist),
+                       "evaluated": len(evaluations), "relax_level": relax_used},
         })
         logger.info("[%s] 評估存活 %d 支（字幕 %d / 影片理解 %d / metadata %d）",
                     course_id, len(evaluations), basis_stats["transcript"],
                     basis_stats["video"], basis_stats["metadata"])
         if len(evaluations) < 3:
-            raise RuntimeError(f"評估後僅剩 {len(evaluations)} 支影片，不足以成課")
+            raise RuntimeError(
+                f"搜尋 {len(candidates)} 支 → 粗篩 {len(shortlist)} 支 → "
+                f"評估存活 {len(evaluations)} 支，不足以成課")
 
         # 5. 編排
         repo.update_course(course_id, {"stage": "編排課綱中", "progress_pct": 88})
@@ -208,13 +226,20 @@ def generate_course(user_id: str, topic: str, lesson_count: int,
         if not plan.lessons:
             raise RuntimeError("編排結果沒有任何課程")
 
+        # 放寬過門檻就要誠實告知（合併進 honest_note，課綱與完成通知都看得到）
+        honest_note = "；".join(filter(None, [
+            plan.honest_note,
+            f"為湊足候選影片，{relaxed_note}" if relaxed_note else "",
+        ]))
+        plan.honest_note = honest_note
+
         repo.save_lessons(course_id, [l.model_dump() for l in plan.lessons])
         repo.update_course(course_id, {
             "status": "ready",
             "stage": "完成",
             "progress_pct": 100,
             "lesson_count": len(plan.lessons),
-            "honest_note": plan.honest_note,
+            "honest_note": honest_note,
             "total_cost_usd": meter.job_total_cost_usd(job_id),
             "charged_points": charged_points,
         })
@@ -281,8 +306,8 @@ def check_dead_links() -> dict:
     alive: set[str] = set()
     with httpx.Client(timeout=30) as client:
         for i in range(0, len(ids), 50):
-            r = client.get(f"{YT_API}/videos", params={
-                "key": api_key, "part": "status", "id": ",".join(ids[i:i + 50])})
+            r = client.get(f"{YT_API}/videos", headers={"x-goog-api-key": api_key},
+                           params={"part": "status", "id": ",".join(ids[i:i + 50])})
             r.raise_for_status()
             for item in r.json().get("items", []):
                 if item.get("status", {}).get("privacyStatus") == "public":
@@ -307,6 +332,9 @@ def _friendly_reason(e: Exception) -> str:
         return "尚未設定 YouTube API key。請輸入「設定」→ 選 3 貼上 key（免費申請）"
     if "平台未設定" in msg:
         return "點數制生成暫時未開放，請輸入「設定」→ 選 2 改用自備 API key"
-    if "不足以成課" in msg or "沒有任何合格影片" in msg or "沒有任何課程" in msg:
-        return "這個主題找到的合格影片太少，換個更常見的主題或減少堂數試試"
+    if "不足以成課" in msg or "粗篩後 0 支" in msg or "沒有任何課程" in msg:
+        detail = f"（{msg}）" if "→" in msg else ""   # 帶出漏斗數字：死在哪一刀一目了然
+        return ("這個主題找到的合格影片太少" + detail
+                + "。可以試：換更口語的說法（用產品或工具名稱）、減少堂數，"
+                  "或放寬契約的時效與片長限制")
     return "系統處理時發生錯誤，請稍後再試一次"

@@ -17,6 +17,10 @@ class LearningContract(BaseModel):
     topic: str                                  # 收斂後的主題（比使用者原話更精確）
     include: list[str] = []                     # 必須涵蓋的子主題
     exclude: list[str] = []                     # 明確排除的子主題
+    # 搜尋種子：訪談中出現的具體實體（產品/品牌/工具/指標名）。
+    # 收斂後的主題是書面語（給人與評估看），創作者下標題用的是這些街頭語言——
+    # include 管語意判斷、seeds 管搜尋用詞，各司其職
+    search_seeds: list[str] = []
     language: Literal["zh_first", "zh_only", "any"] = "zh_first"
     chinese_script: Literal["any", "no_simplified"] = "any"
     start_difficulty: int = Field(default=1, ge=1, le=5)
@@ -52,6 +56,8 @@ class LearningContract(BaseModel):
             f"影片長度：{self.min_duration_min}–{self.max_duration_min} 分鐘",
             f"發布時間：{self._recency_label()}",
         ]
+        if self.search_seeds:
+            lines.append(f"搜尋種子：{'、'.join(self.search_seeds)}")
         if self.channel_blocklist:
             lines.append(f"排除頻道：{'、'.join(self.channel_blocklist)}")
         if self.channel_prioritize:
@@ -93,7 +99,10 @@ class VideoEvaluation(BaseModel):
     """curator 第一段（評估）輸出。"""
     video_id: str
     difficulty: int = Field(ge=1, le=5)
-    quality_score: float = Field(ge=0, le=10)
+    quality_score: float = Field(ge=0, le=10)   # ＝rubric 三項平均（程式重算，非模型自報）
+    # rubric 子項（demonstration 實例演示 / verifiability 可驗證性 / structure 結構）
+    rubric: Optional[dict] = None
+    evidence: list[str] = []                    # 分數佐證：「時間點＋看到什麼」
     topics_covered: list[str] = []
     teaching_style: str = ""
     is_outdated: bool = False

@@ -21,13 +21,26 @@ logger = logging.getLogger(__name__)
 YT_API = "https://www.googleapis.com/youtube/v3"
 
 _EXPAND_SYSTEM = """\
-你是課程策展助手。使用者給你一個學習主題，請展開成 3-5 組 YouTube 搜尋關鍵字，
-涵蓋：中文與英文、入門與進階詞彙。只輸出 JSON 陣列，不要任何其他文字。
-範例輸入：AI工作流
-範例輸出：["AI 工作流 教學", "n8n tutorial", "AI automation workflow", "AI agent 入門", "LangChain 實戰"]
+你是課程策展助手。使用者給你一個學習主題（可能附學習契約），請展開成 3-5 組
+YouTube 搜尋關鍵字。只輸出 JSON 陣列，不要任何其他文字。
 
-若輸入附有「學習契約」，關鍵字展開是它的第一道執行者：
-・每組關鍵字都必須指向「必須涵蓋」的子主題，禁止產生指向「排除」清單的關鍵字
+核心原則：用「創作者下標題的語言」，不是主題的書面描述。
+影片標題寫的是產品名、口語動詞與吸睛詞，沒有人會複述抽象主題：
+・具體實體優先：品牌/產品/工具/指標名（GPT、Claude、n8n、布林通道、MACD）
+・口語動詞：教學、實測、開箱、評測、比較、解析、發表會、實戰
+・禁止把主題原文照抄或改寫成關鍵字
+・禁止在關鍵字寫死年份或具體版本號（你的知識可能過時）——用品牌名不帶版本
+  （「GPT 實測」而非「GPT-4 實測 2024」），時效交給系統的時間過濾器處理
+
+範例輸入：LLM 及大型語言模型的最新技術進展
+範例輸出：["GPT-5 實測", "Claude 新功能 評測", "Gemini 模型 比較", "AI 發表會 解析", "大語言模型 突破"]
+
+範例輸入：AI工作流
+範例輸出：["n8n 教學", "AI automation workflow", "AI agent 入門", "Make 自動化 實戰", "LangChain tutorial"]
+
+若附有「學習契約」，關鍵字展開是它的第一道執行者：
+・「搜尋種子」裡的詞優先入選（那是使用者親口提過的實體）
+・關鍵字服從「必須涵蓋」的語意，禁止產生指向「排除」清單的關鍵字
 ・語言為 zh_only 時只出中文關鍵字；zh_first 出中文為主、至多 1 組英文
 ・起始難度 3 以上時偏進階實戰詞彙，1-2 時偏入門教學詞彙"""
 
@@ -39,31 +52,47 @@ class QuotaExceeded(Exception):
 def expand_topic(topic: str, user_ctx: UserContext, job_id: str | None = None,
                  advanced: bool = False,
                  contract: LearningContract | None = None) -> list[str]:
-    """LLM 展開主題為 3-5 組搜尋關鍵字。advanced=True 時偏向進階/深入詞彙。"""
-    content = (f"{topic}（使用者已完成入門課程，請給進階、深入、實戰導向的關鍵字）"
-               if advanced else topic)
+    """LLM 展開主題為 3-5 組搜尋關鍵字。advanced=True 時偏向進階/深入詞彙。
+
+    非法輸出重試 2 次並帶錯誤回饋（這是管線第一步，死在這裡整門課直接失敗）。
+    """
+    base = (f"{topic}（使用者已完成入門課程，請給進階、深入、實戰導向的關鍵字）"
+            if advanced else topic)
     if contract is not None:
-        content += "\n學習契約：\n" + "\n".join(contract.summary_lines())
-    text = llm.complete(
-        "intent",
-        [{"role": "user", "content": content}],
-        user_ctx,
-        system=_EXPAND_SYSTEM,
-        max_tokens=500,
-        job_id=job_id,
-    )
-    keywords = json.loads(_extract_json(text))
-    if not isinstance(keywords, list) or not keywords:
-        raise ValueError(f"主題展開結果非法: {text[:200]}")
-    return [str(k) for k in keywords[:5]]
+        base += "\n學習契約：\n" + "\n".join(contract.summary_lines())
+
+    last_err: Exception | None = None
+    for _ in range(3):
+        content = base if last_err is None else (
+            base + f"\n\n（你上一次的輸出無法解析：{str(last_err)[:200]}。"
+                   "請只輸出一個合法的 JSON 字串陣列。）")
+        text = llm.complete(
+            "intent",
+            [{"role": "user", "content": content}],
+            user_ctx,
+            system=_EXPAND_SYSTEM,
+            max_tokens=2000,   # Gemini 內建思考吃輸出預算，給足空間防 JSON 截斷
+            job_id=job_id,
+        )
+        try:
+            keywords = json.loads(_extract_json(text))
+            if not isinstance(keywords, list) or not keywords:
+                raise ValueError(f"結果不是非空陣列: {text[:200]}")
+            return [str(k) for k in keywords[:5]]
+        except Exception as e:
+            last_err = e
+    raise ValueError(f"主題展開連續失敗: {last_err}")
 
 
 def _extract_json(text: str) -> str:
-    """容忍模型輸出被 ```json fence 包住。"""
+    """容忍模型輸出被 ```json fence 包住或前後帶雜訊：取第一個 [ 到最後一個 ]。"""
     text = text.strip()
     if text.startswith("```"):
         text = text.split("```")[1]
         text = text.removeprefix("json").strip()
+    start, end = text.find("["), text.rfind("]")
+    if start >= 0 and end > start:
+        return text[start:end + 1]
     return text
 
 
@@ -96,8 +125,8 @@ def search_videos(keywords: list[str], per_keyword: int = 15,
         for kw in keywords:
             if used + 100 > budget:
                 raise QuotaExceeded(f"quota 將超出預算（已用 {used}/{budget}）")
-            r = client.get(f"{YT_API}/search", params={
-                "key": api_key, "part": "snippet", "q": kw, "type": "video",
+            r = client.get(f"{YT_API}/search", headers={"x-goog-api-key": api_key}, params={
+                "part": "snippet", "q": kw, "type": "video",
                 "maxResults": per_keyword, "relevanceLanguage": "zh-Hant",
                 "safeSearch": "moderate",
             })
@@ -118,8 +147,8 @@ def search_videos(keywords: list[str], per_keyword: int = 15,
         ids = list(seen)
         for i in range(0, len(ids), 50):
             batch = ids[i:i + 50]
-            r = client.get(f"{YT_API}/videos", params={
-                "key": api_key, "part": "contentDetails,statistics", "id": ",".join(batch),
+            r = client.get(f"{YT_API}/videos", headers={"x-goog-api-key": api_key}, params={
+                "part": "contentDetails,statistics", "id": ",".join(batch),
             })
             r.raise_for_status()
             used += 1
@@ -135,8 +164,8 @@ def search_videos(keywords: list[str], per_keyword: int = 15,
         subs: dict[str, int] = {}
         for i in range(0, len(ch_ids), 50):
             batch = ch_ids[i:i + 50]
-            r = client.get(f"{YT_API}/channels", params={
-                "key": api_key, "part": "statistics", "id": ",".join(batch),
+            r = client.get(f"{YT_API}/channels", headers={"x-goog-api-key": api_key}, params={
+                "part": "statistics", "id": ",".join(batch),
             })
             r.raise_for_status()
             used += 1
@@ -155,8 +184,8 @@ def fetch_top_comments(video_id: str, api_key: str | None = None, n: int = 5) ->
     if not api_key:
         return []
     try:
-        r = httpx.get(f"{YT_API}/commentThreads", params={
-            "key": api_key, "part": "snippet", "videoId": video_id,
+        r = httpx.get(f"{YT_API}/commentThreads", headers={"x-goog-api-key": api_key}, params={
+            "part": "snippet", "videoId": video_id,
             "maxResults": n, "order": "relevance", "textFormat": "plainText",
         }, timeout=15)
         r.raise_for_status()

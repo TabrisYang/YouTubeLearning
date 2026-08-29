@@ -14,10 +14,12 @@ class GoogleProvider(LLMProvider):
     name = "google"
 
     def _auth(self) -> tuple[dict, dict]:
-        """回傳 (params, headers)：api_key 走 query param，oauth 走 Bearer。"""
+        """回傳 (params, headers)。api_key 一律走 x-goog-api-key header ——
+        禁止放 query param：URL 會出現在 httpx 的例外訊息與各層 log 裡，
+        任何 4xx/5xx 都等於把 key 明文外洩（違反「log 永不含 key」鐵則）。"""
         if self._auth_scheme == "oauth":
             return {}, {"Authorization": f"Bearer {self._api_key}"}
-        return {"key": self._api_key}, {}
+        return {}, {"x-goog-api-key": self._api_key}
 
     def complete(self, messages, model, system="", max_tokens=4096, temperature=0.3) -> LLMResponse:
         contents = [

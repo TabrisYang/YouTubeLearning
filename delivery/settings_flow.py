@@ -364,7 +364,7 @@ def _step_yt_key(user_id: str, text: str) -> list[str]:
     try:
         r = httpx.get(
             "https://www.googleapis.com/youtube/v3/i18nLanguages",
-            params={"key": text, "part": "snippet"}, timeout=15,
+            headers={"x-goog-api-key": text}, params={"part": "snippet"}, timeout=15,
         )
         r.raise_for_status()
     except Exception:
