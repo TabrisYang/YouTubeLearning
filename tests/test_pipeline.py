@@ -1420,3 +1420,135 @@ class TestRecencyDaysAndRetryFeedback:
         main._smart_fallback("uc", "我比較喜歡實戰型的教學影片")
         main._smart_fallback("uc", "照我剛剛說的偏好")
         assert "實戰型的教學影片" in systems[1]          # 第二輪帶著第一輪的語境
+
+
+class TestRubricAndChapters:
+    """評估火力升級：rubric 化打分（程式重算平均）+ 描述欄章節解析。"""
+
+    DESC = ("本影片完整教學！\n"
+            "0:00 前言\n"
+            "3:20 - 支撐壓力的定義\n"
+            "12:45 實戰案例：台積電\n"
+            "更多課程請訂閱")
+
+    def test_parse_chapters(self):
+        from pipeline.curator import parse_chapters
+
+        ch = parse_chapters(self.DESC)
+        assert ch == ["0:00 前言", "3:20 支撐壓力的定義", "12:45 實戰案例：台積電"]
+
+    def test_single_timestamp_not_chapters(self):
+        """描述裡偶然出現一個時間戳 → 不算章節（需 ≥2 條）。"""
+        from pipeline.curator import parse_chapters
+
+        assert parse_chapters("直播 8:30 開始，記得來看") == []
+        assert parse_chapters("") == []
+
+    def test_finalize_recomputes_quality_from_rubric(self):
+        from pipeline.curator import _finalize_eval
+
+        data = _finalize_eval({
+            "quality_score": 9.5,   # 模型自報高分
+            "rubric": {"demonstration": 2, "verifiability": 4, "structure": 6},
+            "evidence": [f"第{i}條佐證" for i in range(5)],
+        })
+        assert data["quality_score"] == 4.0     # 以 rubric 平均為準，不信自報
+        assert len(data["evidence"]) == 3       # 裁切至 3 條
+
+    def test_video_prompt_has_chapters_and_rubric(self):
+        from pipeline.curator import _video_eval_prompt
+
+        cand = make_candidate(description=self.DESC)
+        prompt = _video_eval_prompt(cand, None)
+        assert "3:20 支撐壓力的定義" in prompt
+        assert "rubric" in prompt and "demonstration" in prompt and "evidence" in prompt
+
+    def test_evaluate_end_to_end_with_rubric(self, monkeypatch):
+        import llm
+        from pipeline import curator
+        from pipeline.models import TranscriptResult, UserContext
+
+        monkeypatch.setattr(llm, "complete", lambda *a, **k: (
+            '{"difficulty": 2, "quality_score": 9,'
+            ' "rubric": {"demonstration": 8, "verifiability": 7, "structure": 6},'
+            ' "evidence": ["8:30 用台積電日線實際標出支撐"],'
+            ' "topics_covered": ["支撐壓力"], "teaching_style": "實作演示",'
+            ' "is_outdated": false}'))
+        ev = curator.evaluate(make_candidate(), TranscriptResult(video_id="v1", text="字幕"),
+                              UserContext(user_id="u", billing_mode="points"))
+        assert ev.quality_score == 7.0          # (8+7+6)/3，非自報的 9
+        assert ev.rubric["demonstration"] == 8
+        assert "8:30" in ev.evidence[0]
+
+
+class TestSearchabilityFixes:
+    """「明明有很多影片卻說找不到」的修正：搜尋種子、年齡調整觀看門檻、
+    放寬階梯、失敗訊息帶漏斗數字。"""
+
+    def test_search_seeds_in_summary(self):
+        from pipeline.models import LearningContract
+
+        c = LearningContract(topic="LLM 最新技術進展",
+                             search_seeds=["GPT-5", "Claude", "Gemini"])
+        assert "搜尋種子：GPT-5、Claude、Gemini" in "\n".join(c.summary_lines())
+
+    def test_fresh_video_exempt_from_view_floor(self):
+        """新聞類要害：3 天前的新片觀看數低是正常的，不該被 500 門檻殺掉。"""
+        fresh_low = make_candidate(video_id="f", view_count=80,
+                                   published_at="2026-07-15T00:00:00Z")   # 2 天前
+        old_low = make_candidate(video_id="o", view_count=80,
+                                 published_at="2026-01-01T00:00:00Z")     # 半年前
+        result = filters.apply([fresh_low, old_low], now=NOW)
+        assert [c.video_id for c in result] == ["f"]
+
+    def test_old_video_passes_by_velocity(self):
+        """存量不足但流速夠（觀看/天 ≥ 30）的次新片放行。"""
+        velocity = make_candidate(video_id="v", view_count=400,
+                                  published_at="2026-07-07T00:00:00Z")    # 10 天 → 40/天
+        assert filters.apply([velocity], now=NOW)
+
+    def test_relax_ladder(self):
+        from pipeline.models import LearningContract
+
+        old_low = make_candidate(video_id="a", view_count=80,
+                                 published_at="2026-01-01T00:00:00Z")
+        contract = LearningContract(topic="AI 新聞", recency_months=1)
+        # relax 0：觀看門檻殺掉
+        assert filters.apply([old_low], now=NOW, contract=contract) == []
+        # relax 1：免觀看門檻，但時效硬篩…（單支不足 8 支門檻會放寬，故通過）
+        assert filters.apply([old_low], now=NOW, contract=contract, relax=1)
+        # relax 3：zh_only 放成 zh_first（英文補位），但排除簡體永不放寬
+        en = make_candidate(video_id="en", title="AI news update",
+                            description="english")
+        simp = make_candidate(video_id="s", title="趋势线画对了，进场出场都清楚了")
+        c2 = LearningContract(topic="AI 新聞", language="zh_only",
+                              chinese_script="no_simplified")
+        r = filters.apply([en, simp], now=NOW, contract=c2, relax=3)
+        assert [c.video_id for c in r] == ["en"]    # 英文放行、簡體仍排除
+
+    def test_friendly_reason_carries_funnel(self):
+        import worker
+
+        reason = worker._friendly_reason(
+            RuntimeError("搜尋 62 支 → 粗篩 9 支 → 評估存活 2 支，不足以成課"))
+        assert "62 支 → 粗篩 9 支" in reason and "口語" in reason
+
+    def test_expand_prompt_includes_seeds(self, monkeypatch):
+        """搜尋展開的提示詞帶著契約（含搜尋種子）。"""
+        import llm
+        from pipeline import searcher
+        from pipeline.models import LearningContract, UserContext
+
+        captured = {}
+
+        def fake(purpose, messages, ctx, **kw):
+            captured["content"] = messages[0]["content"]
+            return '["GPT-5 實測", "Claude 評測"]'
+        monkeypatch.setattr(llm, "complete", fake)
+        contract = LearningContract(topic="LLM 最新進展",
+                                    search_seeds=["GPT-5", "Claude"])
+        kws = searcher.expand_topic("LLM 最新進展",
+                                    UserContext(user_id="u", billing_mode="points"),
+                                    contract=contract)
+        assert "搜尋種子：GPT-5、Claude" in captured["content"]
+        assert kws == ["GPT-5 實測", "Claude 評測"]

@@ -64,6 +64,9 @@ repo 是**公開**的（MIT）。以下內容如果要寫進程式碼或文件�
 - **使用者 API key 一律不儲存**：只在 `keyvault.py` 記憶體（TTL），
   不進資料庫、不進 log、回顯一律 `security.mask()`
 - **log 永不記錄使用者訊息內容**（設定流程中可能含 API key）
+- **API key 一律走 HTTP header，禁止放 URL 查詢參數**（Google 系用 `x-goog-api-key`）
+  —— 網址會被例外訊息與各層 log 原文引用，`?key=` 等於任何 4xx/5xx 都把 key
+  明文外洩（歷史教訓：Gemini 503 的 traceback 曾把 key 印上終端）
 - `ENABLE_OAUTH` 正式上線必為 false
 - Push 訊息只有兩個合法場景：課程完成通知、付費每日推播（Reply 免費，優先用）
 

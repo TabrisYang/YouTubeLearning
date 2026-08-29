@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 import llm
 from pipeline.models import (CoursePlan, LearningContract, Lesson, QuizItem,
@@ -21,10 +22,55 @@ MAX_JSON_RETRIES = 2
 
 _EVAL_JSON_BASE = """\
 {"difficulty": 1-5 整數（1=零基礎可看, 5=需深厚先備知識）,
- "quality_score": 0-10 數字（講解清晰度、結構、資訊密度）,
+ "rubric": {
+   "demonstration": 0-10（實例演示：有實際案例、實盤操作、跟打示範才給高分；純講概念中低分）,
+   "verifiability": 0-10（可驗證性：教的方法可以照做並檢驗的程度；含糊斷言、
+     後見之明的「神準預測」、保證獲利話術給低分）,
+   "structure": 0-10（結構完整度：有鋪陳、有主體、有收束，邏輯遞進不跳躍）},
+ "quality_score": 0-10 數字（＝rubric 三項的平均，不可另外憑感覺給）,
+ "evidence": ["1-3 條分數佐證，格式「位置＋看到什麼」——看得到影片就給時間點
+   （例：8:30 用台積電日線實際標出支撐），只有文字就引用原句；沒有佐證的分數不可信，寧可給低分"],
  "topics_covered": ["涵蓋的子主題", ...],
  "teaching_style": "簡短描述（如：實作演示 / 概念講解 / 案例分析）",
  "is_outdated": true/false（內容是否已過時）"""
+
+
+# 描述欄章節時間戳：「0:00 前言」「12:45 - 實戰案例」等格式
+_CHAPTER_LINE = re.compile(
+    r"^\s*[\(\[]?((?:\d{1,2}:)?\d{1,2}:\d{2})[\)\]]?\s*[-–—·:：]?\s*(\S.*)$")
+
+
+def parse_chapters(description: str, limit: int = 15) -> list[str]:
+    """從影片描述欄解析章節時間戳（許多創作者會附）。
+
+    章節是影片結構的免費地圖：評估時模型還沒看片就知道內容分佈。
+    少於 2 條不視為章節（避免描述裡偶然出現的單一時間戳誤判）。
+    """
+    chapters = []
+    for line in (description or "").splitlines():
+        if m := _CHAPTER_LINE.match(line.strip()):
+            chapters.append(f"{m.group(1)} {m.group(2).strip()[:40]}")
+    return chapters[:limit] if len(chapters) >= 2 else []
+
+
+def _chapters_block(description: str) -> str:
+    ch = parse_chapters(description)
+    if not ch:
+        return ""
+    return "影片章節（來自描述欄的時間戳）:\n" + "\n".join(f"- {c}" for c in ch) + "\n"
+
+
+def _finalize_eval(data: dict) -> dict:
+    """評估後處理：quality_score 一律由 rubric 平均重算（防模型口嫌體正直），
+    evidence 裁切至 3 條、每條 120 字。"""
+    rubric = data.get("rubric")
+    if isinstance(rubric, dict):
+        vals = [float(v) for v in rubric.values() if isinstance(v, (int, float))]
+        if vals:
+            data["quality_score"] = round(sum(vals) / len(vals), 1)
+    if isinstance(data.get("evidence"), list):
+        data["evidence"] = [str(e)[:120] for e in data["evidence"][:3]]
+    return data
 
 _EVAL_JSON_CONTRACT_EXTRA = """,
  "contract_fit": 0-10 數字（影片內容與學習契約的吻合度：涵蓋「必須涵蓋」給高分、
@@ -103,12 +149,14 @@ def evaluate(candidate: VideoCandidate, transcript: TranscriptResult,
         f"頻道: {candidate.channel_title}\n"
         f"時長: {candidate.duration_sec // 60} 分鐘 | 觀看: {candidate.view_count} | 按讚: {candidate.like_count}\n"
         f"發布: {candidate.published_at}\n"
-        f"分析依據: {'字幕節錄（頭/中/尾三段取樣）' if transcript.analysis_basis == 'transcript' else '僅 metadata'}\n"
+        + _chapters_block(candidate.description)
+        + f"分析依據: {'字幕節錄（頭/中/尾三段取樣）' if transcript.analysis_basis == 'transcript' else '僅 metadata'}\n"
         f"---\n{sample_for_eval(transcript.text)}"
     )
     try:
-        data = _complete_json("eval", prompt, user_ctx, _eval_system(contract),
-                              job_id, max_tokens=800)
+        data = _finalize_eval(_complete_json("eval", prompt, user_ctx,
+                                             _eval_system(contract), job_id,
+                                             max_tokens=1200))
         return VideoEvaluation(video_id=candidate.video_id,
                                analysis_basis=transcript.analysis_basis, **data)
     except Exception as e:
@@ -130,6 +178,7 @@ def _video_eval_prompt(candidate: VideoCandidate,
         minutes=candidate.duration_sec // 60, views=candidate.view_count,
         published=candidate.published_at,
     )
+    head += _chapters_block(candidate.description)
     if contract is not None:
         head += ("\n評估必須逐條對照這份學習契約（使用者確認過的選片憲法）：\n"
                  + "\n".join(contract.summary_lines()) + "\n")
@@ -145,10 +194,10 @@ def evaluate_by_video(candidate: VideoCandidate, user_ctx: UserContext,
     last_err: Exception | None = None
     for attempt in range(1 + MAX_JSON_RETRIES):
         try:
-            # Gemini 3 有內建思考（吃輸出預算），要給足空間避免 JSON 被截斷
+            # Gemini 3 有內建思考（吃輸出預算），rubric/evidence 又加了欄位 —— 給足空間避免截斷
             text = llm.analyze_video(candidate.url, prompt, user_ctx,
-                                     max_tokens=3000, job_id=job_id)
-            data = json.loads(_extract_json(text))
+                                     max_tokens=4000, job_id=job_id)
+            data = _finalize_eval(json.loads(_extract_json(text)))
             return VideoEvaluation(video_id=candidate.video_id,
                                    analysis_basis="video", **data)
         except Exception as e:

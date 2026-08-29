@@ -37,22 +37,37 @@ def is_simplified(c: VideoCandidate) -> bool:
     return s > t
 
 
+def _age_days(published_at: str, now: datetime | None = None,
+              default: float = 365.0) -> float:
+    """影片年齡（天）。無法解析日期時回 default —— 觀看門檻把無資料當舊片
+    （default=365，吃標準門檻），時效硬篩則放行（default=0，不因缺資料誤殺）。"""
+    try:
+        dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+    except ValueError:
+        return default
+    now = now or datetime.now(timezone.utc)
+    return max(0.0, (now - dt).days)
+
+
 def _hard_pass(c: VideoCandidate, min_sec: int = MIN_DURATION_SEC,
-               max_sec: int = MAX_DURATION_SEC) -> bool:
+               max_sec: int = MAX_DURATION_SEC, now: datetime | None = None,
+               skip_views: bool = False) -> bool:
     if not (min_sec <= c.duration_sec <= max_sec):
         return False
-    if c.view_count < 500:          # 太冷門直接排除
+    if skip_views:                  # 放寬階梯第一級：候選不足時先放存量門檻
+        return True
+    # 觀看門檻按影片年齡調整：新聞時效類的新片存量本來就低，硬門檻會殺掉
+    # 時效性最好的那批 —— 7 天內免門檻，其餘看「存量 or 流速」擇一達標
+    age = _age_days(c.published_at, now)
+    if age <= 7:
+        return True
+    if c.view_count < 500 and c.view_count / max(age, 1.0) < 30:
         return False
     return True
 
 
 def _months_old(published_at: str, now: datetime | None = None) -> float:
-    try:
-        dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
-    except ValueError:
-        return 0.0                  # 無資料不因時效被硬篩
-    now = now or datetime.now(timezone.utc)
-    return (now - dt).days / 30.44
+    return _age_days(published_at, now, default=0.0) / 30.44
 
 
 def _recency_score(published_at: str, now: datetime | None = None) -> float:
@@ -101,10 +116,19 @@ def score(c: VideoCandidate, now: datetime | None = None,
     return base
 
 
+# 放寬階梯（worker 在候選不足時逐級套用）的白話說明，回報給使用者用
+RELAX_NOTES = {
+    1: "放寬了觀看數門檻",
+    2: "放寬了觀看數門檻與發布時間限制",
+    3: "放寬了觀看數門檻、發布時間與語言限制（英文補位）",
+}
+
+
 def apply(candidates: list[VideoCandidate], target: int = TARGET_COUNT,
           now: datetime | None = None, exclude_ids: set[str] | None = None,
           prefs: dict | None = None,
-          contract: LearningContract | None = None) -> list[VideoCandidate]:
+          contract: LearningContract | None = None,
+          relax: int = 0) -> list[VideoCandidate]:
     """硬篩 → 評分 → 語言偏好 → 頻道多樣性上限 → 取前 target 支。
 
     prefs（使用者可調，見設定選單「課程偏好」）：
@@ -113,6 +137,9 @@ def apply(candidates: list[VideoCandidate], target: int = TARGET_COUNT,
       chinese_script: "any"（預設）| "no_simplified"（排除簡體，純繁中）
     exclude_ids: 進階開課時排除已上過的影片。
     contract: 學習契約（片長/時效/頻道黑白名單/語言/流量降權）；語言設定以契約優先。
+    relax: 放寬階梯 0-3（候選不足時由 worker 逐級升）：
+      ≥1 免觀看門檻；≥2 免時效硬篩；≥3 zh_only 放成 zh_first（英文補位）。
+      「排除簡體」與「排除頻道」永不放寬——那是使用者的明確意志。
     """
     prefs = prefs or {}
     exclude_ids = exclude_ids or set()
@@ -127,14 +154,17 @@ def apply(candidates: list[VideoCandidate], target: int = TARGET_COUNT,
         max_sec = contract.max_duration_min * 60
         low_trust = contract.low_trust_popularity
         prioritize = tuple(contract.channel_prioritize)
+    if relax >= 3 and lang_mode == "zh_only":
+        lang_mode = "zh_first"
 
     passed = [c for c in candidates
-              if _hard_pass(c, min_sec, max_sec) and c.video_id not in exclude_ids]
+              if _hard_pass(c, min_sec, max_sec, now, skip_views=relax >= 1)
+              and c.video_id not in exclude_ids]
     if contract is not None and contract.channel_blocklist:
         blocked = [b.lower() for b in contract.channel_blocklist if b]
         passed = [c for c in passed
                   if not any(b in c.channel_title.lower() for b in blocked)]
-    if contract is not None and contract.recency_months:
+    if contract is not None and contract.recency_months and relax < 2:
         fresh = [c for c in passed
                  if _months_old(c.published_at, now) <= contract.recency_months]
         if len(fresh) >= MIN_SHORTLIST_FOR_RECENCY:   # 篩到太少就放寬，靠評分排序
